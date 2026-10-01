@@ -1,7 +1,6 @@
 """GSC audit MCP server (stdio). Read-only unless GSC_ENABLE_WRITE=1."""
 
 import functools
-import hmac
 import inspect
 import ipaddress
 import json
@@ -21,6 +20,7 @@ from urllib.parse import urljoin, urlsplit
 import google_auth_httplib2
 import httplib2
 import httpx
+import oauth
 import uvicorn
 from defusedxml import DefusedXmlException
 from defusedxml.ElementTree import ParseError, fromstring
@@ -44,7 +44,10 @@ mcp = FastMCP(
     "gsc-audit",
     stateless_http=True,
     transport_security=TransportSecuritySettings(allowed_hosts=[_HOST, _HOST + ":*"]),
+    auth_server_provider=oauth.provider,
+    auth=oauth.settings,
 )
+mcp.custom_route("/login", ["GET", "POST"])(oauth.login)
 CAPS = dict(total=1500, analytics=1000, inspect=1500, psi=200, fetch=200, write=20)
 SITE_RE = r"(sc-domain:[a-z0-9.-]+|https?://[^\s/]+/.*)"
 DIMS = {"query", "page", "country", "device", "date", "searchAppearance"}
@@ -693,22 +696,21 @@ def usage_status():
                         for b in CAPS}}
 
 
-def _asgi(inner, token):
-    """Wrap the MCP app: open /health, bearer token elsewhere, strict headers."""
-    hdr = [(b"content-security-policy", b"default-src 'none'"),
+def _asgi(inner):
+    """Wrap the MCP app: open /health and strict response headers on everything."""
+    hdr = [(b"content-security-policy", b"default-src 'none'; frame-ancestors 'none'"),
            (b"x-content-type-options", b"nosniff")]
-    want = b"Bearer " + token.encode()
 
     async def app(scope, receive, send):
         if scope["type"] != "http":
             return await inner(scope, receive, send)
-        got = dict(scope["headers"]).get(b"authorization", b"")
-        health = scope["path"] == "/health" and scope["method"] in ("GET", "HEAD")
-        if health or not hmac.compare_digest(got, want):
-            status = 200 if health else 401
-            start = {"type": "http.response.start", "status": status, "headers": hdr}
+        if scope["path"] == "/token":
+            auth = dict(scope["headers"]).get(b"authorization", b"")
+            oauth.basic.set(auth.startswith(b"Basic "))
+        if scope["path"] == "/health" and scope["method"] in ("GET", "HEAD"):
+            start = {"type": "http.response.start", "status": 200, "headers": hdr}
             await send(start)
-            return await send({"type": "http.response.body", "body": b"ok" * health})
+            return await send({"type": "http.response.body", "body": b"ok"})
 
         async def send_safe(m):
             if m["type"] == "http.response.start":
@@ -721,11 +723,11 @@ def _asgi(inner, token):
 
 
 def _serve_http():
-    """Remote hosting mode: streamable HTTP, bearer auth, Host-checked, no CORS."""
+    """Remote hosting mode: streamable HTTP, OAuth login, Host-checked, no CORS."""
     token = os.environ.get("MCP_AUTH_TOKEN", "")
     if len(token) < 24:
         sys.exit("Set MCP_AUTH_TOKEN (at least 24 characters) for --http")
-    uvicorn.run(_asgi(mcp.streamable_http_app(), token),
+    uvicorn.run(_asgi(mcp.streamable_http_app()),
                 host=os.environ.get("HOST", "127.0.0.1"),
                 port=int(os.environ.get("PORT", 8000)),
                 access_log=False, log_level="warning")

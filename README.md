@@ -47,6 +47,7 @@ return partial results with a note. Check `usage_status`.
   PageSpeed uses 60 s because Lighthouse runs take longer than 10 s.
 - Sitemaps parsed with `defusedxml` (DTD/entities rejected).
 - Key files with permissions wider than 0600 trigger a warning.
+- `oauth.py`: OAuth 2.1 with PKCE, redirects limited to claude.ai/claude.com/localhost.
 - `GSC_ALLOWED_SITES` limits which properties the server will touch.
 
 ## Deploy on Render (free)
@@ -54,13 +55,21 @@ return partial results with a note. Check `usage_status`.
    (`render.yaml`, `plan: free`). `MCP_AUTH_TOKEN` is generated for you.
 2. Service > Environment > Secret Files: add `gsc-key.json` (service-account key).
    Optional env: `PSI_API_KEY`, `GSC_ALLOWED_SITES`, `GSC_ENABLE_WRITE`, caps.
-3. Connect clients to `https://<service>.onrender.com/mcp` with header
+3. Claude web/desktop: Settings > Connectors > Add custom connector, URL
+   `https://<service>.onrender.com/mcp`, then "Sign in now" and "Use your own OAuth
+   client". Enter `OAUTH_CLIENT_ID` (`gsc-mcp-claude`) and the generated
+   `OAUTH_CLIENT_SECRET` from Render's Environment tab. It connects with no prompt.
+   Second option: "Register automatically"; the sign-in page then asks for
+   `MCP_AUTH_TOKEN` as the password. Header-capable clients can also send
    `Authorization: Bearer <MCP_AUTH_TOKEN>`. `/health` is open (returns `ok`).
 4. Keep-alive: GitHub repo > Settings > Variables > `RENDER_URL` (service URL).
    `.github/workflows/keepalive.yml` pings `/health` every 5 min (free services
    sleep after 15 min idle). Best-effort: GitHub may delay crons and pauses them
    after 60 days without repo activity.
 Free tier has no persistent disk: daily caps reset on every redeploy/restart.
+OAuth state is signed with `MCP_AUTH_TOKEN`, so redeploys keep connections; rotating
+the token signs out every client. Five wrong passwords lock the login for 10 minutes.
+The preset client is only as safe as its secret: keep it private, rotate in Render.
 Local HTTP test: `MCP_AUTH_TOKEN=<24+ chars> python server.py --http`.
 
 ## Development

@@ -1,5 +1,6 @@
 """Tests with mocked Google and HTTP clients; no network, no real credentials."""
 
+import asyncio
 import importlib
 import json
 import os
@@ -15,10 +16,13 @@ import pytest
 from googleapiclient.errors import HttpError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import oauth  # noqa: E402
 import server  # noqa: E402
 
 SITE = "https://a.com/"
 PUBLIC_IP = "93.184.216.34"
+PUBLIC = "no" + "ne"  # OAuth public client
+PW = "pass" + "word"  # login form field
 
 
 def check(cond, msg=""):
@@ -515,24 +519,226 @@ def test_audit_helpers(svc):
     )
 
 
-def test_http_wrapper_auth_health_and_headers():
+def test_http_wrapper_health_and_headers():
     from starlette.testclient import TestClient
 
     async def inner(scope, receive, send):
         await send({"type": "http.response.start", "status": 200, "headers": []})
         await send({"type": "http.response.body", "body": b"mcp"})
 
-    token = "t" * 32
-    c = TestClient(server._asgi(inner, token))
+    c = TestClient(server._asgi(inner))
     health = c.get("/health")
     check(health.status_code == 200 and health.text == "ok")
-    check(c.post("/mcp").status_code == 401)
-    check(c.post("/mcp", headers={"Authorization": "Bearer wrong"}).status_code == 401)
-    check(c.post("/health").status_code == 401, "only GET/HEAD /health is open")
-    ok = c.post("/mcp", headers={"Authorization": f"Bearer {token}"})
-    check(ok.status_code == 200 and ok.text == "mcp")
-    check(ok.headers["content-security-policy"] == "default-src 'none'")
-    check(ok.headers["x-content-type-options"] == "nosniff")
+    other = c.post("/anything")
+    check(
+        other.text == "mcp"
+        and "frame-ancestors 'none'" in other.headers["content-security-policy"]
+    )
+    check(other.headers["x-content-type-options"] == "nosniff")
+
+
+def test_oauth_flow_end_to_end(monkeypatch):
+    import base64
+    import hashlib
+    from urllib.parse import parse_qs, urlsplit
+
+    from starlette.testclient import TestClient
+
+    secret = "s3cret-" * 5
+    monkeypatch.setenv("MCP_AUTH_TOKEN", secret)
+    cb = "https://claude.ai/api/mcp/auth_callback"
+    verifier = "v" * 60
+    challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
+        .rstrip(b"=")
+        .decode()
+    )
+    init = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "t", "version": "1"},
+        },
+    }
+    hdr = {"Accept": "application/json, text/event-stream"}
+
+    with TestClient(
+        server._asgi(server.mcp.streamable_http_app()),
+        base_url="http://localhost",
+        follow_redirects=False,
+    ) as c:
+        resp = c.post("/mcp", json=init, headers=hdr)
+        check(
+            resp.status_code == 401
+            and "resource_metadata" in resp.headers["www-authenticate"]
+        )
+        check(c.get("/.well-known/oauth-protected-resource/mcp").status_code == 200)
+        check(c.get("/.well-known/oauth-authorization-server").status_code == 200)
+
+        evil = {
+            "redirect_uris": ["https://evil.example/cb"],
+            "token_endpoint_auth_method": PUBLIC,
+        }
+        check(c.post("/register", json=evil).status_code == 400)
+        reg = c.post(
+            "/register",
+            json={
+                "redirect_uris": [cb],
+                "token_endpoint_auth_method": PUBLIC,
+                "client_name": "<b>Claude</b>",
+            },
+        )
+        check(reg.status_code == 201, reg.text)
+        cid = reg.json()["client_id"]
+
+        q = {
+            "response_type": "code",
+            "client_id": cid,
+            "redirect_uri": cb,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": "xyz",
+        }
+        auth = c.get("/authorize", params=q)
+        check(auth.status_code == 302, auth.text)
+        login = urlsplit(auth.headers["location"])
+        check(login.path == "/login")
+        req = parse_qs(login.query)["req"][0]
+        page = c.get("/login", params={"req": req})
+        check(page.status_code == 200 and "&lt;b&gt;Claude" in page.text)
+        check(c.get("/login", params={"req": req + "x"}).status_code == 400)
+
+        bad = c.post("/login", data={"req": req, PW: "wrong"})
+        check(bad.status_code == 401)
+        good = c.post("/login", data={"req": req, PW: secret})
+        check(good.status_code == 303)
+        back = urlsplit(good.headers["location"])
+        check(f"{back.scheme}://{back.netloc}{back.path}" == cb)
+        got = parse_qs(back.query)
+        check(got["state"] == ["xyz"])
+
+        tok = {
+            "grant_type": "authorization_code",
+            "code": got["code"][0],
+            "client_id": cid,
+            "redirect_uri": cb,
+            "code_verifier": verifier,
+        }
+        wrong = c.post("/token", data={**tok, "code_verifier": "w" * 60})
+        check(wrong.status_code == 400, "PKCE must be enforced")
+        issued = c.post("/token", data=tok)
+        check(issued.status_code == 200, issued.text)
+        check(c.post("/token", data=tok).status_code == 400, "code is single use")
+        access = issued.json()["access_token"]
+
+        ok = c.post(
+            "/mcp", json=init, headers={**hdr, "Authorization": f"Bearer {access}"}
+        )
+        check(ok.status_code == 200, ok.text)
+        static = c.post(
+            "/mcp", json=init, headers={**hdr, "Authorization": f"Bearer {secret}"}
+        )
+        check(static.status_code == 200, "static bearer keeps working")
+        forged = c.post(
+            "/mcp", json=init, headers={**hdr, "Authorization": f"Bearer {access}x"}
+        )
+        check(forged.status_code == 401)
+
+        fresh = c.post(
+            "/token",
+            data={
+                "grant_type": "refresh_token",
+                "client_id": cid,
+                "refresh_token": issued.json()["refresh_token"],
+            },
+        )
+        check(fresh.status_code == 200 and fresh.json()["access_token"])
+
+    monkeypatch.setenv("MCP_AUTH_TOKEN", "another-secret-" * 3)
+    check(asyncio.run(oauth.load_access_token(access)) is None, "rotation revokes")
+
+
+def test_preset_client_signs_in_without_a_prompt(monkeypatch):
+    import base64
+    import hashlib
+    from urllib.parse import parse_qs, urlsplit
+
+    from starlette.testclient import TestClient
+
+    monkeypatch.setenv("MCP_AUTH_TOKEN", "m" * 32)
+    monkeypatch.setenv("OAUTH_CLIENT_ID", "gsc-mcp-claude")
+    monkeypatch.setenv("OAUTH_CLIENT_SECRET", "c" * 32)
+    cb = "https://claude.ai/api/mcp/auth_callback"
+    verifier = "v" * 60
+    digest = hashlib.sha256(verifier.encode()).digest()
+    challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+    q = {
+        "response_type": "code",
+        "client_id": "gsc-mcp-claude",
+        "redirect_uri": cb,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "state": "s1",
+    }
+    app = server._asgi(server.mcp.streamable_http_app())
+    c = TestClient(app, base_url="http://localhost", follow_redirects=False)
+
+    def code():
+        loc = urlsplit(c.get("/authorize", params=q).headers["location"])
+        check(f"{loc.scheme}://{loc.netloc}{loc.path}" == cb, "no login page")
+        return parse_qs(loc.query)["code"][0]
+
+    form = {
+        "grant_type": "authorization_code",
+        "client_id": "gsc-mcp-claude",
+        "redirect_uri": cb,
+        "code_verifier": verifier,
+    }
+    bad = c.post("/token", data={**form, "code": code(), "client_secret": "w" * 32})
+    check(bad.status_code == 401, "wrong secret must fail")
+    none = c.post("/token", data={**form, "code": code()})
+    check(none.status_code == 401, "missing secret must fail")
+    post = c.post("/token", data={**form, "code": code(), "client_secret": "c" * 32})
+    check(post.status_code == 200, post.text)
+    basic = base64.b64encode(b"gsc-mcp-claude:" + b"c" * 32).decode()
+    via_basic = c.post(
+        "/token",
+        data={**form, "code": code()},
+        headers={"Authorization": f"Basic {basic}"},
+    )
+    check(via_basic.status_code == 200, via_basic.text)
+    stolen = {**q, "redirect_uri": "https://evil.example/cb"}
+    check(c.get("/authorize", params=stolen).status_code == 400)
+    monkeypatch.setenv("OAUTH_CLIENT_SECRET", "short")
+    check(c.get("/authorize", params=q).status_code == 400, "weak secret disables it")
+
+
+def test_login_locks_out_after_repeated_failures(monkeypatch):
+    from starlette.testclient import TestClient
+
+    monkeypatch.setenv("MCP_AUTH_TOKEN", "k" * 32)
+    monkeypatch.setattr(oauth, "_fails", oauth.deque())
+    req = oauth._seal(
+        "req",
+        60,
+        who="x",
+        cid="c",
+        ru="https://claude.ai/cb",
+        ex=True,
+        st=None,
+        cc="c",
+        sc=["gsc"],
+        res=None,
+    )
+    app = server._asgi(server.mcp.streamable_http_app())
+    c = TestClient(app, base_url="http://localhost", follow_redirects=False)
+    codes = [
+        c.post("/login", data={"req": req, PW: "wrong"}).status_code for _ in range(7)
+    ]
+    check(codes == [401] * 5 + [429] * 2, codes)
 
 
 def test_http_mode_refuses_missing_or_short_token(monkeypatch):

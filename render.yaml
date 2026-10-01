@@ -17,3 +17,7 @@ services:
         generateValue: true
       - key: GSC_CREDENTIALS_PATH
         value: /etc/secrets/gsc-key.json
+      - key: OAUTH_CLIENT_ID
+        value: gsc-mcp-claude
+      - key: OAUTH_CLIENT_SECRET
+        generateValue: true
