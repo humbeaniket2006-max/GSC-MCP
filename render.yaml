@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: gsc-mcp
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py --http
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: HOST
+        value: 0.0.0.0
+      - key: HOME
+        value: /tmp
+      - key: MCP_AUTH_TOKEN
+        generateValue: true
+      - key: GSC_CREDENTIALS_PATH
+        value: /etc/secrets/gsc-key.json

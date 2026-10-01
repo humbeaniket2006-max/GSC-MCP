@@ -1,0 +1,9 @@
+*.json
+.env
+token*
+*.db
+*.db-journal
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
