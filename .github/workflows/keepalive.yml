@@ -11,7 +11,6 @@ jobs:
     steps:
       - name: Ping /health
         env:
-          RENDER_URL: ${{ vars.RENDER_URL }}
+          RENDER_URL: ${{ vars.RENDER_URL || 'https://gsc-mcp-n9d6.onrender.com' }}
         run: |
-          test -n "$RENDER_URL" || { echo "Set repo variable RENDER_URL"; exit 1; }
           curl -fsS --retry 3 --retry-delay 20 --max-time 60 "${RENDER_URL%/}/health"
